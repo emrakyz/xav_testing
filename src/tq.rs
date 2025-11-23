@@ -8,10 +8,10 @@ use crate::interp::{akima, lerp, natural_cubic, pchip};
 pub type ProbeInfoMap = Arc<std::sync::Mutex<std::collections::HashMap<usize, (f32, Option<f64>)>>>;
 
 #[derive(Clone)]
-struct Probe {
-    crf: f64,
-    score: f64,
-    frame_scores: Vec<f64>,
+pub struct Probe {
+    pub crf: f64,
+    pub score: f64,
+    pub frame_scores: Vec<f64>,
 }
 
 #[derive(Clone)]
@@ -70,7 +70,7 @@ fn round_crf(crf: f64) -> f64 {
     (crf * 4.0).round() / 4.0
 }
 
-fn binary_search(min: f64, max: f64) -> f64 {
+pub fn binary_search(min: f64, max: f64) -> f64 {
     round_crf(f64::midpoint(min, max))
 }
 
@@ -209,7 +209,7 @@ fn measure_quality(
     (result, scores)
 }
 
-fn interpolate_crf(probes: &[Probe], target: f64, round: usize) -> Option<f64> {
+pub fn interpolate_crf(probes: &[Probe], target: f64, round: usize) -> Option<f64> {
     let mut sorted = probes.to_vec();
     sorted.sort_unstable_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
 
@@ -367,4 +367,102 @@ pub fn find_target_quality(
     }
 
     probes.first().map(|p| format!("{:04}_{:.2}.ivf", ctx.chunk.idx, p.crf))
+}
+
+pub fn calc_metrics(
+    pkg: &crate::worker::WorkPkg,
+    probe_path: &Path,
+    inf: &crate::ffms::VidInf,
+    vship: &crate::vship::VshipProcessor,
+    metric_mode: &str,
+    use_cvvdp: bool,
+    use_butteraugli: bool,
+) -> (f64, Vec<f64>) {
+    if use_cvvdp {
+        vship.reset_cvvdp().unwrap();
+    }
+
+    let idx = crate::ffms::VidIdx::new(probe_path, true).unwrap();
+    let threads =
+        std::thread::available_parallelism().map_or(8, |n| n.get().try_into().unwrap_or(8));
+    let src = crate::ffms::thr_vid_src(&idx, threads).unwrap();
+
+    let mut scores = Vec::with_capacity(pkg.frame_count);
+    let frame_size = pkg.yuv.len() / pkg.frame_count;
+
+    let mut working_inf = inf.clone();
+    working_inf.width = pkg.width;
+    working_inf.height = pkg.height;
+    let mut unpacked = vec![0u8; crate::ffms::calc_10bit_size(&working_inf)];
+
+    for frame_idx in 0..pkg.frame_count {
+        let input_packed = &pkg.yuv[frame_idx * frame_size..(frame_idx + 1) * frame_size];
+        let output_frame = crate::ffms::get_frame(src, frame_idx).unwrap();
+
+        let input_yuv: &[u8] = if working_inf.is_10bit {
+            crate::ffms::unpack_10bit(input_packed, &mut unpacked);
+            &unpacked
+        } else {
+            input_packed
+        };
+
+        let pixel_size = if working_inf.is_10bit { 2 } else { 1 };
+        let y_size = (working_inf.width * working_inf.height) as usize * pixel_size;
+        let uv_size = y_size / 4;
+
+        let input_planes = [
+            input_yuv.as_ptr(),
+            input_yuv[y_size..].as_ptr(),
+            input_yuv[y_size + uv_size..].as_ptr(),
+        ];
+        let input_strides = [
+            i64::from(working_inf.width * pixel_size as u32),
+            i64::from(working_inf.width / 2 * pixel_size as u32),
+            i64::from(working_inf.width / 2 * pixel_size as u32),
+        ];
+
+        let output_planes =
+            unsafe { [(*output_frame).data[0], (*output_frame).data[1], (*output_frame).data[2]] };
+        let output_strides = unsafe {
+            [
+                i64::from((*output_frame).linesize[0]),
+                i64::from((*output_frame).linesize[1]),
+                i64::from((*output_frame).linesize[2]),
+            ]
+        };
+
+        let score = if use_butteraugli {
+            vship
+                .compute_butteraugli(input_planes, output_planes, input_strides, output_strides)
+                .unwrap()
+        } else if use_cvvdp {
+            vship.compute_cvvdp(input_planes, output_planes, input_strides, output_strides).unwrap()
+        } else {
+            vship
+                .compute_ssimulacra2(input_planes, output_planes, input_strides, output_strides)
+                .unwrap()
+        };
+        scores.push(score);
+    }
+
+    crate::ffms::destroy_vid_src(src);
+
+    let result = if use_cvvdp {
+        scores.last().copied().unwrap_or(0.0)
+    } else if metric_mode == "mean" {
+        scores.iter().sum::<f64>() / scores.len() as f64
+    } else if let Some(p) = metric_mode.strip_prefix('p') {
+        let percentile: f64 = p.parse().unwrap_or(15.0);
+        if use_butteraugli {
+            scores.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
+        } else {
+            scores.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        }
+        let cutoff = ((scores.len() as f64 * percentile / 100.0).ceil() as usize).min(scores.len());
+        scores[..cutoff].iter().sum::<f64>() / cutoff as f64
+    } else {
+        scores.iter().sum::<f64>() / scores.len() as f64
+    };
+
+    (result, scores)
 }
