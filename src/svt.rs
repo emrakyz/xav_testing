@@ -7,7 +7,7 @@ use std::thread;
 
 use crossbeam_channel::{Sender, bounded, select};
 
-use crate::chunk::{Chunk, ResumeInf, get_resume};
+use crate::chunk::{Chunk, ChunkComp, ResumeInf, get_resume};
 use crate::ffms::{
     VidIdx, VidInf, calc_8bit_size, calc_10bit_size, calc_packed_size, conv_to_10bit,
     destroy_vid_src, extr_8bit, extr_10bit, pack_10bit, thr_vid_src, unpack_10bit,
@@ -431,6 +431,13 @@ impl WorkerStats {
             completions: Arc::new(std::sync::Mutex::new(resume_data)),
         }
     }
+
+    fn add_completion(&self, completion: ChunkComp, work_dir: &Path) {
+        let mut data = self.completions.lock().unwrap();
+        data.chnks_done.push(completion);
+        let _ = crate::chunk::save_resume(&data, work_dir);
+        drop(data);
+    }
 }
 
 pub fn encode_all(
@@ -460,11 +467,7 @@ pub fn encode_all(
     let completed_count = skip_indices.len();
     let completed_frames: usize = resume_data.chnks_done.iter().map(|c| c.frames).sum();
 
-    let stats = if args.quiet {
-        None
-    } else {
-        Some(Arc::new(WorkerStats::new(completed_count, completed_frames, resume_data)))
-    };
+    let stats = Some(Arc::new(WorkerStats::new(completed_count, completed_frames, resume_data)));
 
     let prog = if args.quiet {
         None
@@ -617,6 +620,13 @@ fn encode_tq(
         })
     };
 
+    let resume_state = Arc::new(std::sync::Mutex::new(resume_data.clone()));
+    let tq_logger = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let stats = Some(Arc::new(WorkerStats::new(completed_count, completed_frames, resume_data)));
+
+    let st = stats.clone();
+
     let mut metrics_workers = Vec::new();
     for _ in 0..args.worker {
         let rx = Arc::clone(&met_rx);
@@ -625,6 +635,11 @@ fn encode_tq(
         let inf = inf.clone();
         let wd = work_dir.to_path_buf();
         let metric_mode = args.metric_mode.clone();
+        let st = st.clone();
+        let resume_state = Arc::clone(&resume_state);
+        let tq_logger = Arc::clone(&tq_logger);
+        let log_path = args.input.with_extension("log");
+        let wd_for_log = wd.clone();
 
         metrics_workers.push(thread::spawn(move || {
             let fps = inf.fps_num as f32 / inf.fps_den as f32;
@@ -674,6 +689,7 @@ fn encode_tq(
                 );
 
                 let tq_state = pkg.tq_state.as_mut().unwrap();
+                let round = tq_state.round;
                 tq_state.probes.push(crate::tq::Probe { crf, score, frame_scores });
 
                 let in_range = if use_butteraugli {
@@ -686,6 +702,47 @@ fn encode_tq(
                     let dst = wd.join("encode").join(format!("{:04}.ivf", pkg.chunk.idx));
                     std::fs::copy(&probe_path, &dst).unwrap();
                     done_tx.send(pkg.chunk.idx).unwrap();
+
+                    let file_size = std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
+                    let comp = crate::chunk::ChunkComp {
+                        idx: pkg.chunk.idx,
+                        frames: pkg.frame_count,
+                        size: file_size,
+                    };
+
+                    let mut resume = resume_state.lock().unwrap();
+                    resume.chnks_done.push(comp.clone());
+                    crate::chunk::save_resume(&resume, &wd).ok();
+                    drop(resume);
+
+                    if let Some(ref s) = st {
+                        s.completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        s.completions.lock().unwrap().chnks_done.push(comp);
+                    }
+
+                    let log_entry = crate::tq::ProbeLog {
+                        chunk_idx: pkg.chunk.idx,
+                        probes: tq_state.probes.iter().map(|p| (p.crf, p.score)).collect(),
+                        final_crf: crf,
+                        final_score: score,
+                        round,
+                    };
+                    write_chunk_log(&log_entry, &log_path, &wd_for_log);
+                    tq_logger.lock().unwrap().push(log_entry);
+
+                    if use_cvvdp {
+                        TQ_SCORES
+                            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+                            .lock()
+                            .unwrap()
+                            .push(score);
+                    } else {
+                        TQ_SCORES
+                            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+                            .lock()
+                            .unwrap()
+                            .extend_from_slice(&tq_state.probes.last().unwrap().frame_scores);
+                    }
                 } else {
                     if use_butteraugli {
                         if score > tq_target + tq_tolerance {
@@ -703,6 +760,47 @@ fn encode_tq(
                         let dst = wd.join("encode").join(format!("{:04}.ivf", pkg.chunk.idx));
                         std::fs::copy(&probe_path, &dst).unwrap();
                         done_tx.send(pkg.chunk.idx).unwrap();
+
+                        let file_size = std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
+                        let comp = crate::chunk::ChunkComp {
+                            idx: pkg.chunk.idx,
+                            frames: pkg.frame_count,
+                            size: file_size,
+                        };
+
+                        let mut resume = resume_state.lock().unwrap();
+                        resume.chnks_done.push(comp.clone());
+                        crate::chunk::save_resume(&resume, &wd).ok();
+                        drop(resume);
+
+                        if let Some(ref s) = st {
+                            s.completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            s.completions.lock().unwrap().chnks_done.push(comp);
+                        }
+
+                        let log_entry = crate::tq::ProbeLog {
+                            chunk_idx: pkg.chunk.idx,
+                            probes: tq_state.probes.iter().map(|p| (p.crf, p.score)).collect(),
+                            final_crf: crf,
+                            final_score: score,
+                            round,
+                        };
+                        write_chunk_log(&log_entry, &log_path, &wd_for_log);
+                        tq_logger.lock().unwrap().push(log_entry);
+
+                        if use_cvvdp {
+                            TQ_SCORES
+                                .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+                                .lock()
+                                .unwrap()
+                                .push(score);
+                        } else {
+                            TQ_SCORES
+                                .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+                                .lock()
+                                .unwrap()
+                                .extend_from_slice(&tq_state.probes.last().unwrap().frame_scores);
+                        }
                     } else {
                         rework_tx.send(pkg).unwrap();
                     }
@@ -756,12 +854,6 @@ fn encode_tq(
         }));
     }
 
-    let stats = if args.quiet {
-        None
-    } else {
-        Some(Arc::new(WorkerStats::new(completed_count, completed_frames, resume_data)))
-    };
-
     let prog = stats.as_ref().map(|s| {
         Arc::new(ProgsTrack::new(
             chunks,
@@ -796,8 +888,6 @@ fn encode_tq(
 
     write_tq_log(&args.input, work_dir);
 }
-
-const fn write_tq_log(_input: &std::path::Path, _work_dir: &std::path::Path) {}
 
 fn enc_tq_probe(
     pkg: &crate::worker::WorkPkg,
@@ -840,9 +930,14 @@ fn run_enc_worker(
 
         if let Some(s) = stats {
             s.completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let comp =
-                crate::chunk::ChunkComp { idx: pkg.chunk.idx, frames: pkg.frame_count, size: 0 };
-            s.completions.lock().unwrap().chnks_done.push(comp);
+            let out = work_dir.join("encode").join(format!("{:04}.ivf", pkg.chunk.idx));
+            let file_size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+            let comp = crate::chunk::ChunkComp {
+                idx: pkg.chunk.idx,
+                frames: pkg.frame_count,
+                size: file_size,
+            };
+            s.add_completion(comp, work_dir);
         }
     }
 }
@@ -868,4 +963,126 @@ fn enc_chunk(
 
     write_frames(&mut child, &pkg.yuv, frame_size, pkg.frame_count, &working_inf, conv_buf);
     child.wait().unwrap();
+}
+
+pub fn write_chunk_log(chunk_log: &crate::tq::ProbeLog, log_path: &Path, work_dir: &Path) {
+    use std::fmt::Write;
+    use std::fs::OpenOptions;
+    use std::io::Write as IoWrite;
+
+    let chunks_path = work_dir.join("chunks.log");
+    let mut content = String::new();
+    let probes_str = chunk_log
+        .probes
+        .iter()
+        .map(|(c, s)| format!("({c:.2}, {s:.2})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        content,
+        "{:04}:{}:{}:{:.2}:{:.2}",
+        chunk_log.chunk_idx,
+        chunk_log.probes.len(),
+        chunk_log.round,
+        chunk_log.final_crf,
+        chunk_log.final_score
+    );
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(chunks_path) {
+        let _ = file.write_all(content.as_bytes());
+    }
+
+    let mut readable = String::new();
+    let _ = writeln!(
+        readable,
+        "{:04}: [{}] = {:.2}, {:.2}",
+        chunk_log.chunk_idx, probes_str, chunk_log.final_crf, chunk_log.final_score
+    );
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = file.write_all(readable.as_bytes());
+    }
+}
+
+fn write_tq_log(input: &Path, work_dir: &Path) {
+    use std::collections::HashMap;
+    use std::fmt::Write;
+    use std::fs::OpenOptions;
+    use std::io::Write as IoWrite;
+
+    let log_path = input.with_extension("log");
+    let chunks_path = work_dir.join("chunks.log");
+
+    let mut all_logs = Vec::new();
+
+    if let Ok(content) = std::fs::read_to_string(&chunks_path) {
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() == 5
+                && let (Ok(idx), Ok(probes), Ok(round), Ok(crf), Ok(score)) = (
+                    parts[0].parse::<usize>(),
+                    parts[1].parse::<usize>(),
+                    parts[2].parse::<usize>(),
+                    parts[3].parse::<f64>(),
+                    parts[4].parse::<f64>(),
+                )
+            {
+                all_logs.push((idx, probes, round, crf, score));
+            }
+        }
+    }
+
+    let total = all_logs.len();
+    if total == 0 {
+        return;
+    }
+
+    let avg_probes = all_logs.iter().map(|(_, p, _, _, _)| p).sum::<usize>() as f64 / total as f64;
+    let in_range = all_logs.iter().filter(|(_, _, r, _, _)| *r < 10).count();
+    let out_range = total - in_range;
+
+    let mut round_counts: HashMap<usize, usize> = HashMap::new();
+    let mut crf_counts: HashMap<String, usize> = HashMap::new();
+
+    for (_, probes, _, crf, _) in &all_logs {
+        *round_counts.entry(*probes).or_insert(0) += 1;
+        *crf_counts.entry(format!("{crf:.2}")).or_insert(0) += 1;
+    }
+
+    let mut summary = String::new();
+    let _ = writeln!(summary, "\nAverage No of Probes: {avg_probes:.1}");
+    let _ = writeln!(summary, "In-range: {in_range} chunks");
+    let _ = writeln!(summary, "Out-range: {out_range} chunks\n");
+
+    let method_name = |round: usize| match round {
+        3 => "linear",
+        4 => "natural",
+        5 => "PCHIP",
+        6 => "AKIMA",
+        _ => "binary",
+    };
+
+    let mut rounds: Vec<_> = round_counts.iter().collect();
+    rounds.sort_by_key(|(r, _)| *r);
+
+    for (round, count) in rounds {
+        let pct = *count as f64 / total as f64 * 100.0;
+        let _ = writeln!(
+            summary,
+            "{round} probe finish: {count} scenes ({}) -> {pct:.2}%",
+            method_name(*round)
+        );
+    }
+
+    let mut crfs: Vec<_> = crf_counts.iter().collect();
+    crfs.sort_by(|(_, a), (_, b)| b.cmp(a));
+
+    let _ = writeln!(summary, "\nMost popular CRFs:");
+    for (crf, count) in crfs {
+        let _ = writeln!(summary, "{crf}: {count} times");
+    }
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = file.write_all(summary.as_bytes());
+    }
 }

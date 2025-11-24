@@ -9,6 +9,15 @@ pub struct Probe {
     pub frame_scores: Vec<f64>,
 }
 
+#[derive(Clone)]
+pub struct ProbeLog {
+    pub chunk_idx: usize,
+    pub probes: Vec<(f64, f64)>,
+    pub final_crf: f64,
+    pub final_score: f64,
+    pub round: usize,
+}
+
 fn round_crf(crf: f64) -> f64 {
     (crf * 4.0).round() / 4.0
 }

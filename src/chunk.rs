@@ -15,12 +15,14 @@ pub struct Chunk {
     pub end: usize,
 }
 
+#[derive(Clone)]
 pub struct ChunkComp {
     pub idx: usize,
     pub frames: usize,
     pub size: u64,
 }
 
+#[derive(Clone)]
 pub struct ResumeInf {
     pub chnks_done: Vec<ChunkComp>,
 }
@@ -97,6 +99,25 @@ pub fn get_resume(work_dir: &Path) -> Option<ResumeInf> {
             Some(ResumeInf { chnks_done })
         })
         .flatten()
+}
+
+pub fn save_resume(data: &ResumeInf, work_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let path = work_dir.join("done.txt");
+    let mut content = String::new();
+
+    for chunk in &data.chnks_done {
+        use std::fmt::Write;
+        let _ = writeln!(
+            content,
+            "{idx} {frames} {size}",
+            idx = chunk.idx,
+            frames = chunk.frames,
+            size = chunk.size
+        );
+    }
+
+    fs::write(path, content)?;
+    Ok(())
 }
 
 pub fn merge_out(
