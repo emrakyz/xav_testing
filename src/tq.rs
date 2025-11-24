@@ -377,15 +377,24 @@ pub fn calc_metrics(
     metric_mode: &str,
     use_cvvdp: bool,
     use_butteraugli: bool,
+    unpacked_buf: &mut Vec<u8>,
 ) -> (f64, Vec<f64>) {
+    eprintln!("calc_metrics: START for chunk {}", pkg.chunk.idx);
+
     if use_cvvdp {
         vship.reset_cvvdp().unwrap();
     }
 
+    eprintln!("calc_metrics: creating VidIdx for chunk {}", pkg.chunk.idx);
     let idx = crate::ffms::VidIdx::new(probe_path, true).unwrap();
     let threads =
         std::thread::available_parallelism().map_or(8, |n| n.get().try_into().unwrap_or(8));
+    eprintln!(
+        "calc_metrics: opening video source with {} threads for chunk {}",
+        threads, pkg.chunk.idx
+    );
     let src = crate::ffms::thr_vid_src(&idx, threads).unwrap();
+    eprintln!("calc_metrics: video source opened for chunk {}", pkg.chunk.idx);
 
     let mut scores = Vec::with_capacity(pkg.frame_count);
     let frame_size = pkg.yuv.len() / pkg.frame_count;
@@ -393,15 +402,14 @@ pub fn calc_metrics(
     let mut working_inf = inf.clone();
     working_inf.width = pkg.width;
     working_inf.height = pkg.height;
-    let mut unpacked = vec![0u8; crate::ffms::calc_10bit_size(&working_inf)];
 
     for frame_idx in 0..pkg.frame_count {
         let input_packed = &pkg.yuv[frame_idx * frame_size..(frame_idx + 1) * frame_size];
         let output_frame = crate::ffms::get_frame(src, frame_idx).unwrap();
 
         let input_yuv: &[u8] = if working_inf.is_10bit {
-            crate::ffms::unpack_10bit(input_packed, &mut unpacked);
-            &unpacked
+            crate::ffms::unpack_10bit(input_packed, unpacked_buf);
+            &unpacked_buf
         } else {
             input_packed
         };
@@ -445,7 +453,9 @@ pub fn calc_metrics(
         scores.push(score);
     }
 
+    eprintln!("calc_metrics: destroying video source for chunk {}", pkg.chunk.idx);
     crate::ffms::destroy_vid_src(src);
+    eprintln!("calc_metrics: video source destroyed for chunk {}", pkg.chunk.idx);
 
     let result = if use_cvvdp {
         scores.last().copied().unwrap_or(0.0)
@@ -464,5 +474,6 @@ pub fn calc_metrics(
         scores.iter().sum::<f64>() / scores.len() as f64
     };
 
+    eprintln!("calc_metrics: DONE for chunk {}, result={}", pkg.chunk.idx, result);
     (result, scores)
 }
