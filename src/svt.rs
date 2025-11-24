@@ -719,43 +719,25 @@ fn encode_tq(
             let mut in_flight = 0;
             let max_in_flight = worker_count + 1;
             let mut completed = 0;
-            let mut pending_chunks: Vec<crate::worker::WorkPkg> = Vec::new();
-
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            let pkg_count = Arc::new(AtomicUsize::new(0));
 
             while completed < total_chunks {
                 if in_flight < max_in_flight {
                     select! {
                         recv(decode_rx) -> pkg => {
                             if let Ok(pkg) = pkg {
-                                pkg_count.fetch_add(1, Ordering::SeqCst);
-                                eprintln!("BG-DECODE: chunk {}, in_flight={}, total_pkgs={}", pkg.chunk.idx, in_flight, pkg_count.load(Ordering::SeqCst));
                                 enc_tx.send(pkg).unwrap();
                                 in_flight += 1;
-                                eprintln!("BG-DECODE-SENT: chunk sent to worker, in_flight now={}", in_flight);
                             }
                         }
                         recv(rework_rx) -> pkg => {
                             if let Ok(pkg) = pkg {
-                                eprintln!("BG-REWORK: chunk {}, in_flight={}, total_pkgs={}", pkg.chunk.idx, in_flight, pkg_count.load(Ordering::SeqCst));
                                 enc_tx.send(pkg).unwrap();
-                                eprintln!("BG-REWORK-SENT: chunk sent to worker");
                             }
                         }
                         recv(done_rx) -> result => {
-                            if let Ok(chunk_idx) = result {
-                                pkg_count.fetch_sub(1, Ordering::SeqCst);
+                            if let Ok(_) = result {
                                 in_flight -= 1;
                                 completed += 1;
-                                eprintln!("BG-DONE: chunk {}, in_flight={}, total_pkgs={}, completed={}/{}", chunk_idx, in_flight, pkg_count.load(Ordering::SeqCst), completed, total_chunks);
-
-                                while in_flight < max_in_flight && !pending_chunks.is_empty() {
-                                    let pkg = pending_chunks.remove(0);
-                                    eprintln!("BG-DRAINING: chunk {} from pending", pkg.chunk.idx);
-                                    enc_tx.send(pkg).unwrap();
-                                    in_flight += 1;
-                                }
                             }
                         }
                     }
@@ -763,24 +745,13 @@ fn encode_tq(
                     select! {
                         recv(rework_rx) -> pkg => {
                             if let Ok(pkg) = pkg {
-                                eprintln!("BG-REWORK-FULL: chunk {}, in_flight={} (AT LIMIT), total_pkgs={}", pkg.chunk.idx, in_flight, pkg_count.load(Ordering::SeqCst));
                                 enc_tx.send(pkg).unwrap();
-                                eprintln!("BG-REWORK-FULL-SENT: chunk sent to worker");
                             }
                         }
                         recv(done_rx) -> result => {
-                            if let Ok(chunk_idx) = result {
-                                pkg_count.fetch_sub(1, Ordering::SeqCst);
+                            if let Ok(_) = result {
                                 in_flight -= 1;
                                 completed += 1;
-                                eprintln!("BG-DONE-FULL: chunk {}, in_flight={}, total_pkgs={}, completed={}/{}", chunk_idx, in_flight, pkg_count.load(Ordering::SeqCst), completed, total_chunks);
-
-                                while in_flight < max_in_flight && !pending_chunks.is_empty() {
-                                    let pkg = pending_chunks.remove(0);
-                                    eprintln!("BG-DRAINING-FULL: chunk {} from pending", pkg.chunk.idx);
-                                    enc_tx.send(pkg).unwrap();
-                                    in_flight += 1;
-                                }
                             }
                         }
                     }
@@ -791,7 +762,7 @@ fn encode_tq(
     };
 
     let mut metrics_workers = Vec::new();
-    for i in 0..args.worker {
+    for _ in 0..args.worker {
         let rx = Arc::clone(&met_rx);
         let rework_tx = rework_tx.clone();
         let done_tx = done_tx.clone();
@@ -806,13 +777,6 @@ fn encode_tq(
             let mut unpacked_buf: Option<Vec<u8>> = None;
 
             while let Ok(mut pkg) = rx.recv() {
-                eprintln!(
-                    "METRICS[{}]: received chunk {}, round {}",
-                    i,
-                    pkg.chunk.idx,
-                    pkg.tq_state.as_ref().map(|t| t.round).unwrap_or(0)
-                );
-
                 if vship.is_none() {
                     working_inf.width = pkg.width;
                     working_inf.height = pkg.height;
@@ -832,8 +796,9 @@ fn encode_tq(
                         )
                         .unwrap(),
                     );
-                    unpacked_buf = Some(vec![0u8; crate::ffms::calc_10bit_size(&working_inf)]);
-                    eprintln!("METRICS[{}]: initialized vship", i);
+                    if inf.is_10bit {
+                        unpacked_buf = Some(vec![0u8; crate::ffms::calc_10bit_size(&working_inf)]);
+                    }
                 }
 
                 let tq_st = pkg.tq_state.as_ref().unwrap();
@@ -841,7 +806,6 @@ fn encode_tq(
                 let probe_path =
                     wd.join("split").join(format!("{:04}_{:.2}.ivf", pkg.chunk.idx, crf));
 
-                eprintln!("METRICS[{}]: calling calc_metrics for chunk {}", i, pkg.chunk.idx);
                 let (score, frame_scores) = crate::tq::calc_metrics(
                     &pkg,
                     &probe_path,
@@ -850,11 +814,7 @@ fn encode_tq(
                     &metric_mode,
                     use_cvvdp,
                     use_butteraugli,
-                    unpacked_buf.as_mut().unwrap(),
-                );
-                eprintln!(
-                    "METRICS[{}]: calc_metrics done for chunk {}, score={}",
-                    i, pkg.chunk.idx, score
+                    unpacked_buf.as_mut(),
                 );
 
                 let tq_state = pkg.tq_state.as_mut().unwrap();
@@ -867,14 +827,9 @@ fn encode_tq(
                 };
 
                 if in_range || tq_state.round > 10 {
-                    eprintln!(
-                        "METRICS[{}]: chunk {} DONE (in_range={}, round={})",
-                        i, pkg.chunk.idx, in_range, tq_state.round
-                    );
                     let dst = wd.join("encode").join(format!("{:04}.ivf", pkg.chunk.idx));
                     std::fs::copy(&probe_path, &dst).unwrap();
                     done_tx.send(pkg.chunk.idx).unwrap();
-                    eprintln!("METRICS[{}]: sent DONE signal for chunk {}", i, pkg.chunk.idx);
                 } else {
                     if use_butteraugli {
                         if score > tq_target + tq_tolerance {
@@ -889,16 +844,11 @@ fn encode_tq(
                     }
 
                     if tq_state.search_min > tq_state.search_max {
-                        eprintln!("METRICS[{}]: chunk {} DONE (bounds crossed)", i, pkg.chunk.idx);
                         let dst = wd.join("encode").join(format!("{:04}.ivf", pkg.chunk.idx));
                         std::fs::copy(&probe_path, &dst).unwrap();
                         done_tx.send(pkg.chunk.idx).unwrap();
-                        eprintln!("METRICS[{}]: sent DONE signal for chunk {}", i, pkg.chunk.idx);
                     } else {
-                        eprintln!("METRICS[{}]: chunk {} needs REWORK", i, pkg.chunk.idx);
-                        let chunk_idx = pkg.chunk.idx;
                         rework_tx.send(pkg).unwrap();
-                        eprintln!("METRICS[{}]: sent to rework_tx for chunk {}", i, chunk_idx);
                     }
                 }
             }
@@ -906,7 +856,7 @@ fn encode_tq(
     }
 
     let mut workers = Vec::new();
-    for i in 0..args.worker {
+    for _ in 0..args.worker {
         let rx = Arc::clone(&enc_rx);
         let tx = met_tx.clone();
         let inf = inf.clone();
@@ -918,13 +868,6 @@ fn encode_tq(
             let mut conv_buf = Some(vec![0u8; crate::ffms::calc_10bit_size(&inf)]);
 
             while let Ok(mut pkg) = rx.recv() {
-                eprintln!(
-                    "WORKER[{}]: received chunk {}, round {}",
-                    i,
-                    pkg.chunk.idx,
-                    pkg.tq_state.as_ref().map(|t| t.round).unwrap_or(0)
-                );
-
                 if pkg.tq_state.is_none() {
                     pkg.tq_state = Some(crate::worker::TQState {
                         probes: Vec::new(),
@@ -935,7 +878,6 @@ fn encode_tq(
                         tolerance: tq_tolerance,
                         last_crf: 0.0,
                     });
-                    eprintln!("WORKER[{}]: initialized tq_state for chunk {}", i, pkg.chunk.idx);
                 } else {
                     pkg.tq_state.as_mut().unwrap().round += 1;
                 }
@@ -952,19 +894,9 @@ fn encode_tq(
 
                 pkg.tq_state.as_mut().unwrap().last_crf = crf;
 
-                eprintln!(
-                    "WORKER[{}]: encoding chunk {} round {} crf {}",
-                    i, pkg.chunk.idx, current_round, crf
-                );
                 enc_tq_probe(&pkg, crf, &params, &inf, &wd, grain.as_deref(), &mut conv_buf);
-                eprintln!(
-                    "WORKER[{}]: encoding done for chunk {}, sending to metrics",
-                    i, pkg.chunk.idx
-                );
 
-                let chunk_idx = pkg.chunk.idx;
                 tx.send(pkg).unwrap();
-                eprintln!("WORKER[{}]: sent chunk {} to met_tx", i, chunk_idx);
             }
         }));
     }
