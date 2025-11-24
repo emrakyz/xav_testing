@@ -16,7 +16,6 @@ pub struct TQState {
     pub search_max: f64,
     pub round: usize,
     pub target: f64,
-    pub tolerance: f64,
     pub last_crf: f64,
 }
 

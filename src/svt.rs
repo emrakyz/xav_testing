@@ -735,7 +735,7 @@ fn encode_tq(
                             }
                         }
                         recv(done_rx) -> result => {
-                            if let Ok(_) = result {
+                            if result.is_ok() {
                                 in_flight -= 1;
                                 completed += 1;
                             }
@@ -749,7 +749,7 @@ fn encode_tq(
                             }
                         }
                         recv(done_rx) -> result => {
-                            if let Ok(_) = result {
+                            if result.is_ok() {
                                 in_flight -= 1;
                                 completed += 1;
                             }
@@ -875,7 +875,6 @@ fn encode_tq(
                         search_max: qp_max,
                         round: 1,
                         target: tq_target,
-                        tolerance: tq_tolerance,
                         last_crf: 0.0,
                     });
                 } else {
