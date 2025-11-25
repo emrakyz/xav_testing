@@ -495,16 +495,27 @@ pub fn encode_all(
     };
 
     let mut workers = Vec::new();
-    for _ in 0..args.worker {
+    for worker_id in 0..args.worker {
         let rx_clone = Arc::clone(&rx);
         let inf = inf.clone();
         let params = args.params.clone();
         let stats_clone = stats.clone();
         let grain = grain_table.cloned();
         let wd = work_dir.to_path_buf();
+        let prog_clone = prog.clone();
+        let wid = worker_id;
 
         let handle = thread::spawn(move || {
-            run_enc_worker(&rx_clone, &params, &inf, &wd, grain.as_deref(), stats_clone.as_ref());
+            run_enc_worker(
+                &rx_clone,
+                &params,
+                &inf,
+                &wd,
+                grain.as_deref(),
+                stats_clone.as_ref(),
+                prog_clone.as_ref(),
+                wid,
+            );
         });
         workers.push(handle);
     }
@@ -627,8 +638,19 @@ fn encode_tq(
 
     let st = stats.clone();
 
+    let prog = stats.as_ref().map(|s| {
+        Arc::new(ProgsTrack::new(
+            chunks,
+            inf,
+            args.worker * 2,
+            completed_frames,
+            Arc::clone(&s.completed),
+            Arc::clone(&s.completions),
+        ))
+    });
+
     let mut metrics_workers = Vec::new();
-    for _ in 0..args.worker {
+    for worker_id in 0..args.worker {
         let rx = Arc::clone(&met_rx);
         let rework_tx = rework_tx.clone();
         let done_tx = done_tx.clone();
@@ -640,6 +662,9 @@ fn encode_tq(
         let tq_logger = Arc::clone(&tq_logger);
         let log_path = args.input.with_extension("log");
         let wd_for_log = wd.clone();
+        let prog_clone = prog.clone();
+        let wid = worker_id;
+        let worker_count = args.worker;
 
         metrics_workers.push(thread::spawn(move || {
             let fps = inf.fps_num as f32 / inf.fps_den as f32;
@@ -677,6 +702,12 @@ fn encode_tq(
                 let probe_path =
                     wd.join("split").join(format!("{:04}_{:.2}.ivf", pkg.chunk.idx, crf));
 
+                let tq_st = pkg.tq_state.as_ref().unwrap();
+                let crf = tq_st.last_crf;
+                let last_score = tq_st.probes.last().map(|probe| probe.score);
+
+                let metrics_slot = worker_count + wid;
+
                 let (score, frame_scores) = crate::tq::calc_metrics(
                     &pkg,
                     &probe_path,
@@ -686,6 +717,10 @@ fn encode_tq(
                     use_cvvdp,
                     use_butteraugli,
                     unpacked_buf.as_mut(),
+                    prog_clone.as_ref(),
+                    metrics_slot,
+                    crf as f32,
+                    last_score,
                 );
 
                 let tq_state = pkg.tq_state.as_mut().unwrap();
@@ -810,13 +845,15 @@ fn encode_tq(
     }
 
     let mut workers = Vec::new();
-    for _ in 0..args.worker {
+    for worker_id in 0..args.worker {
         let rx = Arc::clone(&enc_rx);
         let tx = met_tx.clone();
         let inf = inf.clone();
         let params = args.params.clone();
         let wd = work_dir.to_path_buf();
         let grain = grain_table.cloned();
+        let prog_clone = prog.clone();
+        let wid = worker_id;
 
         workers.push(thread::spawn(move || {
             let mut conv_buf = Some(vec![0u8; crate::ffms::calc_10bit_size(&inf)]);
@@ -847,23 +884,22 @@ fn encode_tq(
 
                 pkg.tq_state.as_mut().unwrap().last_crf = crf;
 
-                enc_tq_probe(&pkg, crf, &params, &inf, &wd, grain.as_deref(), &mut conv_buf);
+                enc_tq_probe(
+                    &pkg,
+                    crf,
+                    &params,
+                    &inf,
+                    &wd,
+                    grain.as_deref(),
+                    &mut conv_buf,
+                    prog_clone.as_ref(),
+                    wid,
+                );
 
                 tx.send(pkg).unwrap();
             }
         }));
     }
-
-    let prog = stats.as_ref().map(|s| {
-        Arc::new(ProgsTrack::new(
-            chunks,
-            inf,
-            args.worker,
-            completed_frames,
-            Arc::clone(&s.completed),
-            Arc::clone(&s.completions),
-        ))
-    });
 
     crate::vship::init_device().unwrap();
 
@@ -882,7 +918,7 @@ fn encode_tq(
         mw.join().unwrap();
     }
 
-    if let Some(p) = prog {
+    if let Some(ref p) = prog {
         p.final_update();
     }
 
@@ -897,12 +933,21 @@ fn enc_tq_probe(
     work_dir: &Path,
     grain: Option<&Path>,
     conv_buf: &mut Option<Vec<u8>>,
+    prog: Option<&Arc<ProgsTrack>>,
+    worker_id: usize,
 ) -> PathBuf {
     let name = format!("{:04}_{:.2}.ivf", pkg.chunk.idx, crf);
     let out = work_dir.join("split").join(&name);
     let cfg = EncConfig { inf, params, crf: crf as f32, output: &out, grain_table: grain };
-    let mut cmd = make_enc_cmd(&cfg, true, pkg.width, pkg.height);
+    let mut cmd = make_enc_cmd(&cfg, false, pkg.width, pkg.height);
     let mut child = cmd.spawn().unwrap();
+
+    if let Some(p) = prog {
+        let stderr = child.stderr.take().unwrap();
+        let last_score =
+            pkg.tq_state.as_ref().and_then(|tq| tq.probes.last().map(|probe| probe.score));
+        p.watch_enc(stderr, worker_id, pkg.chunk.idx, false, Some((crf as f32, last_score)));
+    }
 
     let frame_size = pkg.yuv.len() / pkg.frame_count;
 
@@ -921,12 +966,14 @@ fn run_enc_worker(
     work_dir: &Path,
     grain: Option<&Path>,
     stats: Option<&Arc<WorkerStats>>,
+    prog: Option<&Arc<ProgsTrack>>,
+    worker_id: usize,
 ) {
     let mut conv_buf = Some(vec![0u8; crate::ffms::calc_10bit_size(inf)]);
 
     while let Ok(pkg) = rx.recv() {
         let crf = -1.0;
-        enc_chunk(&pkg, crf, params, inf, work_dir, grain, &mut conv_buf);
+        enc_chunk(&pkg, crf, params, inf, work_dir, grain, &mut conv_buf, prog, worker_id);
 
         if let Some(s) = stats {
             s.completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -950,11 +997,19 @@ fn enc_chunk(
     work_dir: &Path,
     grain: Option<&Path>,
     conv_buf: &mut Option<Vec<u8>>,
+    prog: Option<&Arc<ProgsTrack>>,
+    worker_id: usize,
 ) {
     let out = work_dir.join("encode").join(format!("{:04}.ivf", pkg.chunk.idx));
     let cfg = EncConfig { inf, params, crf, output: &out, grain_table: grain };
     let mut cmd = make_enc_cmd(&cfg, false, pkg.width, pkg.height);
+    cmd.stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn().unwrap();
+
+    if let Some(p) = prog {
+        let stderr = child.stderr.take().unwrap();
+        p.watch_enc(stderr, worker_id, pkg.chunk.idx, true, None);
+    }
 
     let frame_size = pkg.yuv.len() / pkg.frame_count;
     let mut working_inf = inf.clone();

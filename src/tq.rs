@@ -56,6 +56,10 @@ pub fn calc_metrics(
     use_cvvdp: bool,
     use_butteraugli: bool,
     mut unpacked_buf: Option<&mut Vec<u8>>,
+    prog: Option<&std::sync::Arc<crate::progs::ProgsTrack>>,
+    worker_id: usize,
+    crf: f32,
+    last_score: Option<f64>,
 ) -> (f64, Vec<f64>) {
     if use_cvvdp {
         vship.reset_cvvdp().unwrap();
@@ -73,7 +77,23 @@ pub fn calc_metrics(
     working_inf.width = pkg.width;
     working_inf.height = pkg.height;
 
+    let start = std::time::Instant::now();
+
     for frame_idx in 0..pkg.frame_count {
+        if let Some(p) = prog {
+            let elapsed = start.elapsed().as_secs_f32().max(0.001);
+            let fps = (frame_idx + 1) as f32 / elapsed;
+            p.show_metric_progress(
+                worker_id,
+                pkg.chunk.idx,
+                frame_idx + 1,
+                pkg.frame_count,
+                fps,
+                crf,
+                last_score,
+            );
+        }
+
         let input_frame = &pkg.yuv[frame_idx * frame_size..(frame_idx + 1) * frame_size];
         let output_frame = crate::ffms::get_frame(src, frame_idx).unwrap();
 
