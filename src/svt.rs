@@ -525,10 +525,6 @@ pub fn encode_all(
     for handle in workers {
         handle.join().unwrap();
     }
-
-    if let Some(ref p) = prog {
-        p.final_update();
-    }
 }
 
 #[cfg(feature = "vship")]
@@ -916,10 +912,6 @@ fn encode_tq(
 
     for mw in metrics_workers {
         mw.join().unwrap();
-    }
-
-    if let Some(ref p) = prog {
-        p.final_update();
     }
 
     write_tq_log(&args.input, work_dir);

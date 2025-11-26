@@ -268,9 +268,6 @@ impl ProgsTrack {
     pub fn clear_worker(&self, worker_id: usize) {
         self.tx.send(WorkerMsg::Clear(worker_id)).ok();
     }
-
-    #[allow(clippy::unused_self)]
-    pub const fn final_update(&self) {}
 }
 
 fn parse_frame_count(line: &str) -> Option<usize> {
