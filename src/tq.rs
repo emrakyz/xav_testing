@@ -86,11 +86,9 @@ pub fn calc_metrics(
             p.show_metric_progress(
                 worker_id,
                 pkg.chunk.idx,
-                frame_idx + 1,
-                pkg.frame_count,
+                (frame_idx + 1, pkg.frame_count),
                 fps,
-                crf,
-                last_score,
+                (crf, last_score),
             );
         }
 

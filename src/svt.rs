@@ -115,6 +115,62 @@ fn colorize(cmd: &mut Command, inf: &VidInf) {
     }
 }
 
+struct CropCalc {
+    new_w: u32,
+    new_h: u32,
+    y_stride: usize,
+    uv_stride: usize,
+    y_start: usize,
+    u_start: usize,
+    v_start: usize,
+    y_len: usize,
+    uv_len: usize,
+}
+
+impl CropCalc {
+    const fn new(inf: &VidInf, crop: (u32, u32), pixel_sz: usize) -> Self {
+        let (crop_v, crop_h) = crop;
+        let new_w = inf.width - crop_h * 2;
+        let new_h = inf.height - crop_v * 2;
+
+        let y_stride = (inf.width * pixel_sz as u32) as usize;
+        let uv_stride = (inf.width / 2 * pixel_sz as u32) as usize;
+        let y_start = ((crop_v * inf.width + crop_h) as usize) * pixel_sz;
+        let y_plane_sz = (inf.width * inf.height) as usize * pixel_sz;
+        let uv_plane_sz = (inf.width / 2 * inf.height / 2) as usize * pixel_sz;
+        let u_start = y_plane_sz + ((crop_v / 2 * inf.width / 2 + crop_h / 2) as usize * pixel_sz);
+        let v_start = y_plane_sz
+            + uv_plane_sz
+            + ((crop_v / 2 * inf.width / 2 + crop_h / 2) as usize * pixel_sz);
+        let y_len = (new_w * pixel_sz as u32) as usize;
+        let uv_len = (new_w / 2 * pixel_sz as u32) as usize;
+
+        Self { new_w, new_h, y_stride, uv_stride, y_start, u_start, v_start, y_len, uv_len }
+    }
+
+    fn crop_frame(&self, src: &[u8], dst: &mut [u8]) {
+        let mut pos = 0;
+
+        for row in 0..self.new_h {
+            let src_off = self.y_start + row as usize * self.y_stride;
+            dst[pos..pos + self.y_len].copy_from_slice(&src[src_off..src_off + self.y_len]);
+            pos += self.y_len;
+        }
+
+        for row in 0..self.new_h / 2 {
+            let src_off = self.u_start + row as usize * self.uv_stride;
+            dst[pos..pos + self.uv_len].copy_from_slice(&src[src_off..src_off + self.uv_len]);
+            pos += self.uv_len;
+        }
+
+        for row in 0..self.new_h / 2 {
+            let src_off = self.v_start + row as usize * self.uv_stride;
+            dst[pos..pos + self.uv_len].copy_from_slice(&src[src_off..src_off + self.uv_len]);
+            pos += self.uv_len;
+        }
+    }
+}
+
 fn dec_10bit(
     chunks: &[Chunk],
     source: *mut std::ffi::c_void,
@@ -122,114 +178,46 @@ fn dec_10bit(
     tx: &Sender<crate::worker::WorkPkg>,
     crop: (u32, u32),
 ) {
-    if crop == (0, 0) {
-        let frame_size = calc_10bit_size(inf);
-        let packed_size = calc_packed_size(inf);
-        let mut frame_buf = vec![0u8; frame_size];
+    let crop_calc = (crop != (0, 0)).then(|| CropCalc::new(inf, crop, 2));
+    let (width, height, frame_sz, packed_sz) = crop_calc.as_ref().map_or_else(
+        || (inf.width, inf.height, calc_10bit_size(inf), calc_packed_size(inf)),
+        |c| {
+            let new_y_sz = (c.new_w * c.new_h * 2) as usize;
+            let new_uv_sz = (c.new_w * c.new_h / 2) as usize;
+            let new_frame_sz = new_y_sz + new_uv_sz * 2;
+            (c.new_w, c.new_h, new_frame_sz, (new_frame_sz * 5).div_ceil(4))
+        },
+    );
 
-        for chunk in chunks {
-            let chunk_len = chunk.end - chunk.start;
-            let mut frames_data = vec![0u8; chunk_len * packed_size];
-            let mut valid = 0;
+    let mut frame_buf = vec![0u8; calc_10bit_size(inf)];
+    let mut cropped_buf = crop_calc.as_ref().map(|_| vec![0u8; frame_sz]);
 
-            for (i, idx) in (chunk.start..chunk.end).enumerate() {
-                let start = i * packed_size;
-                let dest = &mut frames_data[start..start + packed_size];
+    for chunk in chunks {
+        let chunk_len = chunk.end - chunk.start;
+        let mut frames_data = vec![0u8; chunk_len * packed_sz];
+        let mut valid = 0;
 
-                if extr_10bit(source, idx, &mut frame_buf).is_err() {
-                    continue;
-                }
-
-                pack_10bit(&frame_buf, dest);
-                valid += 1;
+        for (i, idx) in (chunk.start..chunk.end).enumerate() {
+            if extr_10bit(source, idx, &mut frame_buf).is_err() {
+                continue;
             }
 
-            if valid > 0 {
-                frames_data.truncate(valid * packed_size);
-                let pkg = crate::worker::WorkPkg::new(
-                    chunk.clone(),
-                    frames_data,
-                    valid,
-                    inf.width,
-                    inf.height,
-                );
-                tx.send(pkg).ok();
-            }
+            let to_pack = if let (Some(calc), Some(buf)) = (&crop_calc, &mut cropped_buf) {
+                calc.crop_frame(&frame_buf, buf);
+                buf.as_slice()
+            } else {
+                &frame_buf
+            };
+
+            let start = i * packed_sz;
+            pack_10bit(to_pack, &mut frames_data[start..start + packed_sz]);
+            valid += 1;
         }
-    } else {
-        let (crop_v, crop_h) = crop;
-        let new_width = inf.width - crop_h * 2;
-        let new_height = inf.height - crop_v * 2;
 
-        let orig_frame_size = calc_10bit_size(inf);
-        let new_y_size = (new_width * new_height * 2) as usize;
-        let new_uv_size = (new_width * new_height / 2) as usize;
-        let new_frame_size = new_y_size + new_uv_size * 2;
-        let new_packed_size = (new_frame_size * 5).div_ceil(4);
-
-        let y_stride = (inf.width * 2) as usize;
-        let uv_stride = (inf.width / 2 * 2) as usize;
-        let y_start = ((crop_v * inf.width + crop_h) as usize) * 2;
-        let y_plane_size = (inf.width * inf.height) as usize * 2;
-        let uv_plane_size = (inf.width / 2 * inf.height / 2) as usize * 2;
-        let u_start = y_plane_size + ((crop_v / 2 * inf.width / 2 + crop_h / 2) as usize * 2);
-        let v_start =
-            y_plane_size + uv_plane_size + ((crop_v / 2 * inf.width / 2 + crop_h / 2) as usize * 2);
-        let y_len = (new_width * 2) as usize;
-        let uv_len = (new_width / 2 * 2) as usize;
-
-        let mut frame_buf = vec![0u8; orig_frame_size];
-        let mut cropped_buf = vec![0u8; new_frame_size];
-
-        for chunk in chunks {
-            let chunk_len = chunk.end - chunk.start;
-            let mut frames_data = vec![0u8; chunk_len * new_packed_size];
-            let mut valid = 0;
-
-            for (i, idx) in (chunk.start..chunk.end).enumerate() {
-                if extr_10bit(source, idx, &mut frame_buf).is_err() {
-                    continue;
-                }
-
-                let mut pos = 0;
-
-                for row in 0..new_height {
-                    let src = y_start + row as usize * y_stride;
-                    cropped_buf[pos..pos + y_len].copy_from_slice(&frame_buf[src..src + y_len]);
-                    pos += y_len;
-                }
-
-                for row in 0..new_height / 2 {
-                    let src = u_start + row as usize * uv_stride;
-                    cropped_buf[pos..pos + uv_len].copy_from_slice(&frame_buf[src..src + uv_len]);
-                    pos += uv_len;
-                }
-
-                for row in 0..new_height / 2 {
-                    let src = v_start + row as usize * uv_stride;
-                    cropped_buf[pos..pos + uv_len].copy_from_slice(&frame_buf[src..src + uv_len]);
-                    pos += uv_len;
-                }
-
-                let dest_start = i * new_packed_size;
-                pack_10bit(
-                    &cropped_buf,
-                    &mut frames_data[dest_start..dest_start + new_packed_size],
-                );
-                valid += 1;
-            }
-
-            if valid > 0 {
-                frames_data.truncate(valid * new_packed_size);
-                let pkg = crate::worker::WorkPkg::new(
-                    chunk.clone(),
-                    frames_data,
-                    valid,
-                    new_width,
-                    new_height,
-                );
-                tx.send(pkg).ok();
-            }
+        if valid > 0 {
+            frames_data.truncate(valid * packed_sz);
+            let pkg = crate::worker::WorkPkg::new(chunk.clone(), frames_data, valid, width, height);
+            tx.send(pkg).ok();
         }
     }
 }
@@ -241,103 +229,41 @@ fn dec_8bit(
     tx: &Sender<crate::worker::WorkPkg>,
     crop: (u32, u32),
 ) {
-    if crop == (0, 0) {
-        let frame_size = calc_8bit_size(inf);
+    let crop_calc = (crop != (0, 0)).then(|| CropCalc::new(inf, crop, 1));
+    let (width, height, frame_sz) = crop_calc.as_ref().map_or_else(
+        || (inf.width, inf.height, calc_8bit_size(inf)),
+        |c| {
+            let new_y_sz = (c.new_w * c.new_h) as usize;
+            let new_uv_sz = (c.new_w * c.new_h / 4) as usize;
+            (c.new_w, c.new_h, new_y_sz + new_uv_sz * 2)
+        },
+    );
 
-        for chunk in chunks {
-            let chunk_len = chunk.end - chunk.start;
-            let mut frames_data = vec![0u8; chunk_len * frame_size];
-            let mut valid = 0;
+    let mut frame_buf = vec![0u8; calc_8bit_size(inf)];
 
-            for (i, idx) in (chunk.start..chunk.end).enumerate() {
-                let start = i * frame_size;
-                let dest = &mut frames_data[start..start + frame_size];
+    for chunk in chunks {
+        let chunk_len = chunk.end - chunk.start;
+        let mut frames_data = vec![0u8; chunk_len * frame_sz];
+        let mut valid = 0;
 
-                if extr_8bit(source, idx, dest).is_ok() {
-                    valid += 1;
-                }
+        for (i, idx) in (chunk.start..chunk.end).enumerate() {
+            if extr_8bit(source, idx, &mut frame_buf).is_err() {
+                continue;
             }
 
-            if valid > 0 {
-                frames_data.truncate(valid * frame_size);
-                let pkg = crate::worker::WorkPkg::new(
-                    chunk.clone(),
-                    frames_data,
-                    valid,
-                    inf.width,
-                    inf.height,
-                );
-                tx.send(pkg).ok();
+            let dest_start = i * frame_sz;
+            if let Some(calc) = &crop_calc {
+                calc.crop_frame(&frame_buf, &mut frames_data[dest_start..dest_start + frame_sz]);
+            } else {
+                frames_data[dest_start..dest_start + frame_sz].copy_from_slice(&frame_buf);
             }
+            valid += 1;
         }
-    } else {
-        let (crop_v, crop_h) = crop;
-        let new_width = inf.width - crop_h * 2;
-        let new_height = inf.height - crop_v * 2;
 
-        let orig_frame_size = calc_8bit_size(inf);
-        let new_y_size = (new_width * new_height) as usize;
-        let new_uv_size = (new_width * new_height / 4) as usize;
-        let new_frame_size = new_y_size + new_uv_size * 2;
-
-        let y_stride = inf.width as usize;
-        let uv_stride = (inf.width / 2) as usize;
-        let y_start = (crop_v * inf.width + crop_h) as usize;
-        let y_plane_size = (inf.width * inf.height) as usize;
-        let uv_plane_size = (inf.width / 2 * inf.height / 2) as usize;
-        let u_start = y_plane_size + ((crop_v / 2 * inf.width / 2 + crop_h / 2) as usize);
-        let v_start =
-            y_plane_size + uv_plane_size + ((crop_v / 2 * inf.width / 2 + crop_h / 2) as usize);
-        let y_len = new_width as usize;
-        let uv_len = (new_width / 2) as usize;
-
-        let mut frame_buf = vec![0u8; orig_frame_size];
-
-        for chunk in chunks {
-            let chunk_len = chunk.end - chunk.start;
-            let mut frames_data = vec![0u8; chunk_len * new_frame_size];
-            let mut valid = 0;
-
-            for (i, idx) in (chunk.start..chunk.end).enumerate() {
-                if extr_8bit(source, idx, &mut frame_buf).is_err() {
-                    continue;
-                }
-
-                let dest_start = i * new_frame_size;
-                let mut pos = dest_start;
-
-                for row in 0..new_height {
-                    let src = y_start + row as usize * y_stride;
-                    frames_data[pos..pos + y_len].copy_from_slice(&frame_buf[src..src + y_len]);
-                    pos += y_len;
-                }
-
-                for row in 0..new_height / 2 {
-                    let src = u_start + row as usize * uv_stride;
-                    frames_data[pos..pos + uv_len].copy_from_slice(&frame_buf[src..src + uv_len]);
-                    pos += uv_len;
-                }
-
-                for row in 0..new_height / 2 {
-                    let src = v_start + row as usize * uv_stride;
-                    frames_data[pos..pos + uv_len].copy_from_slice(&frame_buf[src..src + uv_len]);
-                    pos += uv_len;
-                }
-
-                valid += 1;
-            }
-
-            if valid > 0 {
-                frames_data.truncate(valid * new_frame_size);
-                let pkg = crate::worker::WorkPkg::new(
-                    chunk.clone(),
-                    frames_data,
-                    valid,
-                    new_width,
-                    new_height,
-                );
-                tx.send(pkg).ok();
-            }
+        if valid > 0 {
+            frames_data.truncate(valid * frame_sz);
+            let pkg = crate::worker::WorkPkg::new(chunk.clone(), frames_data, valid, width, height);
+            tx.send(pkg).ok();
         }
     }
 }
@@ -852,9 +778,18 @@ fn encode_tq(
         let wid = worker_id;
 
         workers.push(thread::spawn(move || {
-            let mut conv_buf = Some(vec![0u8; crate::ffms::calc_10bit_size(&inf)]);
+            let mut conv_buf: Option<Vec<u8>> = None;
+            let mut working_inf = inf.clone();
+            let mut last_dims = (0, 0);
 
             while let Ok(mut pkg) = rx.recv() {
+                if (pkg.width, pkg.height) != last_dims {
+                    working_inf.width = pkg.width;
+                    working_inf.height = pkg.height;
+                    conv_buf = Some(vec![0u8; crate::ffms::calc_10bit_size(&working_inf)]);
+                    last_dims = (pkg.width, pkg.height);
+                }
+
                 if pkg.tq_state.is_none() {
                     pkg.tq_state = Some(crate::worker::TQState {
                         probes: Vec::new(),
@@ -884,7 +819,7 @@ fn encode_tq(
                     &pkg,
                     crf,
                     &params,
-                    &inf,
+                    &working_inf,
                     &wd,
                     grain.as_deref(),
                     &mut conv_buf,
@@ -961,11 +896,29 @@ fn run_enc_worker(
     prog: Option<&Arc<ProgsTrack>>,
     worker_id: usize,
 ) {
-    let mut conv_buf = Some(vec![0u8; crate::ffms::calc_10bit_size(inf)]);
+    let mut conv_buf: Option<Vec<u8>> = None;
+    let mut working_inf = inf.clone();
+    let mut last_dims = (0, 0);
 
     while let Ok(pkg) = rx.recv() {
-        let crf = -1.0;
-        enc_chunk(&pkg, crf, params, inf, work_dir, grain, &mut conv_buf, prog, worker_id);
+        if (pkg.width, pkg.height) != last_dims {
+            working_inf.width = pkg.width;
+            working_inf.height = pkg.height;
+            conv_buf = Some(vec![0u8; calc_10bit_size(&working_inf)]);
+            last_dims = (pkg.width, pkg.height);
+        }
+
+        enc_chunk(
+            &pkg,
+            -1.0,
+            params,
+            &working_inf,
+            work_dir,
+            grain,
+            &mut conv_buf,
+            prog,
+            worker_id,
+        );
 
         if let Some(s) = stats {
             s.completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

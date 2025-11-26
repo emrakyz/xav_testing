@@ -25,6 +25,15 @@ pub struct ProgsBar {
     last_update: Instant,
 }
 
+struct ProgState {
+    total_chunks: usize,
+    total_frames: usize,
+    fps_num: usize,
+    fps_den: usize,
+    completed: Arc<AtomicUsize>,
+    completions: Arc<Mutex<crate::chunk::ResumeInf>>,
+}
+
 impl ProgsBar {
     pub fn new(quiet: bool) -> Self {
         let now = Instant::now();
@@ -131,18 +140,11 @@ impl ProgsTrack {
         let fps_num = inf.fps_num as usize;
         let fps_den = inf.fps_den as usize;
 
+        let state =
+            ProgState { total_chunks, total_frames, fps_num, fps_den, completed, completions };
+
         thread::spawn(move || {
-            display_loop(
-                rx,
-                worker_count,
-                total_chunks,
-                total_frames,
-                init_frames,
-                fps_num,
-                fps_den,
-                &completed,
-                &completions,
-            );
+            display_loop(&rx, worker_count, init_frames, &state);
         });
 
         Self { tx }
@@ -185,19 +187,18 @@ impl ProgsTrack {
 
                 if cleaned.contains("fpm") {
                     let parts: Vec<&str> = cleaned.split_whitespace().collect();
-                    if let Some(fpm_pos) = parts.iter().position(|&s| s == "fpm") {
-                        if fpm_pos > 0 {
-                            let num_str = parts[fpm_pos - 1];
-                            let num_clean =
-                                num_str.replace("\u{1b}[32m", "").replace("\u{1b}[0m", "");
-                            if let Ok(fpm) = num_clean.parse::<f32>() {
-                                let fps = fpm / 60.0;
-                                cleaned = cleaned.replacen(
-                                    &format!("{} fpm", num_str),
-                                    &format!("\u{1b}[32m{:.2}\u{1b}[0m fps", fps),
-                                    1,
-                                );
-                            }
+                    if let Some(fpm_pos) = parts.iter().position(|&s| s == "fpm")
+                        && fpm_pos > 0
+                    {
+                        let num_str = parts[fpm_pos - 1];
+                        let num_clean = num_str.replace("\u{1b}[32m", "").replace("\u{1b}[0m", "");
+                        if let Ok(fpm) = num_clean.parse::<f32>() {
+                            let fps = fpm / 60.0;
+                            cleaned = cleaned.replacen(
+                                &format!("{num_str} fpm"),
+                                &format!("\u{1b}[32m{fps:.2}\u{1b}[0m fps"),
+                                1,
+                            );
                         }
                     }
                 }
@@ -230,28 +231,16 @@ impl ProgsTrack {
         });
     }
 
-    pub fn show_metrics(
-        &self,
-        worker_id: usize,
-        chunk_idx: usize,
-        crf: f32,
-        last_score: Option<f64>,
-    ) {
-        let score_str = last_score.map_or(String::new(), |s| format!(" / {s:.2}"));
-        let line = format!("{C}[{chunk_idx:04} / F {crf:.2}{score_str}{C}] Calculating metrics...");
-        self.tx.send(WorkerMsg::Update { worker_id, line, frames: None }).ok();
-    }
-
     pub fn show_metric_progress(
         &self,
         worker_id: usize,
         chunk_idx: usize,
-        current: usize,
-        total: usize,
+        progress: (usize, usize),
         fps: f32,
-        crf: f32,
-        last_score: Option<f64>,
+        crf_score: (f32, Option<f64>),
     ) {
+        let (current, total) = progress;
+        let (crf, last_score) = crf_score;
         let filled = (BAR_WIDTH * current / total.max(1)).min(BAR_WIDTH);
         let bar = format!("{}{}", G_HASH.repeat(filled), R_DASH.repeat(BAR_WIDTH - filled));
         let perc = (current * 100 / total.max(1)).min(100);
@@ -263,10 +252,6 @@ impl ProgsTrack {
         );
 
         self.tx.send(WorkerMsg::Update { worker_id, line, frames: None }).ok();
-    }
-
-    pub fn clear_worker(&self, worker_id: usize) {
-        self.tx.send(WorkerMsg::Clear(worker_id)).ok();
     }
 }
 
@@ -290,15 +275,10 @@ fn parse_frame_count(line: &str) -> Option<usize> {
 }
 
 fn display_loop(
-    rx: crossbeam_channel::Receiver<WorkerMsg>,
+    rx: &crossbeam_channel::Receiver<WorkerMsg>,
     worker_count: usize,
-    total_chunks: usize,
-    total_frames: usize,
     init_frames: usize,
-    fps_num: usize,
-    fps_den: usize,
-    completed: &Arc<AtomicUsize>,
-    completions: &Arc<Mutex<crate::chunk::ResumeInf>>,
+    state: &ProgState,
 ) {
     let start = Instant::now();
     let mut lines = vec![String::new(); worker_count];
@@ -325,46 +305,19 @@ fn display_loop(
         }
 
         if last_draw.elapsed() >= Duration::from_millis(1000) {
-            draw_screen(
-                &lines,
-                worker_count,
-                &start,
-                total_chunks,
-                total_frames,
-                fps_num,
-                fps_den,
-                &completed,
-                &completions,
-                &processed,
-            );
+            draw_screen(&lines, worker_count, &start, state, &processed);
             last_draw = Instant::now();
         }
     }
 
-    draw_screen(
-        &lines,
-        worker_count,
-        &start,
-        total_chunks,
-        total_frames,
-        fps_num,
-        fps_den,
-        &completed,
-        &completions,
-        &processed,
-    );
+    draw_screen(&lines, worker_count, &start, state, &processed);
 }
 
 fn draw_screen(
     lines: &[String],
     worker_count: usize,
     start: &Instant,
-    total_chunks: usize,
-    total_frames: usize,
-    fps_num: usize,
-    fps_den: usize,
-    completed: &Arc<AtomicUsize>,
-    completions: &Arc<Mutex<crate::chunk::ResumeInf>>,
+    state: &ProgState,
     processed: &Arc<AtomicUsize>,
 ) {
     print!("\x1b[u");
@@ -379,7 +332,7 @@ fn draw_screen(
 
     print!("\r\x1b[2K\n");
 
-    let data = completions.lock().unwrap();
+    let data = state.completions.lock().unwrap();
     let completed_frames: usize = data.chnks_done.iter().map(|c| c.frames).sum();
     let total_size: u64 = data.chnks_done.iter().map(|c| c.size).sum();
     let chunk_frames: usize = data.chnks_done.iter().map(|c| c.frames).sum();
@@ -390,14 +343,14 @@ fn draw_screen(
 
     let elapsed_secs = start.elapsed().as_secs() as usize;
     let fps = frames_done as f32 / elapsed_secs.max(1) as f32;
-    let remaining = total_frames.saturating_sub(frames_done);
+    let remaining = state.total_frames.saturating_sub(frames_done);
     let eta_secs = remaining * elapsed_secs / frames_done.max(1);
-    let chunks_done = completed.load(Ordering::Relaxed);
+    let chunks_done = state.completed.load(Ordering::Relaxed);
 
     let (bitrate_str, est_str) = if chunk_frames > 0 {
-        let dur = chunk_frames as f32 * fps_den as f32 / fps_num as f32;
+        let dur = chunk_frames as f32 * state.fps_den as f32 / state.fps_num as f32;
         let kbps = total_size as f32 * 8.0 / dur / 1000.0;
-        let total_dur = total_frames as f32 * fps_den as f32 / fps_num as f32;
+        let total_dur = state.total_frames as f32 * state.fps_den as f32 / state.fps_num as f32;
         let est_size = kbps * total_dur * 1000.0 / 8.0;
         let est = if est_size > 1_000_000_000.0 {
             format!("{:.1} GB", est_size / 1_000_000_000.0)
@@ -409,17 +362,18 @@ fn draw_screen(
         (format!("{B}0 kb"), format!("{R}0 MB"))
     };
 
-    let progress = (frames_done * BAR_WIDTH / total_frames.max(1)).min(BAR_WIDTH);
-    let perc = (frames_done * 100 / total_frames.max(1)).min(100);
+    let progress = (frames_done * BAR_WIDTH / state.total_frames.max(1)).min(BAR_WIDTH);
+    let perc = (frames_done * 100 / state.total_frames.max(1)).min(100);
     let bar = format!("{}{}", G_HASH.repeat(progress), R_DASH.repeat(BAR_WIDTH - progress));
 
     let (m, s) = (elapsed_secs / 60, elapsed_secs % 60);
     let (eta_m, eta_s) = (eta_secs / 60, eta_secs % 60);
 
     println!(
-        "{W}{m:02}{P}:{W}{s:02} {C}[{G}{chunks_done}{C}/{R}{total_chunks}{C}] [{bar}{C}] \
-         {W}{perc}% {G}{frames_done}{C}/{R}{total_frames} {C}({Y}{fps:.2} FPS{C}, \
-         {W}{eta_m:02}{P}:{W}{eta_s:02}{C}, {bitrate_str}{C}, {est_str}{C}){N}"
+        "{W}{m:02}{P}:{W}{s:02} {C}[{G}{chunks_done}{C}/{R}{}{C}] [{bar}{C}] {W}{perc}% \
+         {G}{frames_done}{C}/{R}{} {C}({Y}{fps:.2} FPS{C}, {W}{eta_m:02}{P}:{W}{eta_s:02}{C}, \
+         {bitrate_str}{C}, {est_str}{C}){N}",
+        state.total_chunks, state.total_frames
     );
 
     std::io::stdout().flush().unwrap();
