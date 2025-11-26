@@ -168,6 +168,12 @@ impl ProgsTrack {
                 let Ok(text) = std::str::from_utf8(&line) else { continue };
                 let text = text.trim();
 
+                if text.contains("error") || text.contains("Error") {
+                    print!("\x1b[?1049l");
+                    std::io::stdout().flush().unwrap();
+                    eprintln!("{text}");
+                }
+
                 if text.is_empty() || !text.contains("Encoding:") || text.contains("SUMMARY") {
                     continue;
                 }

@@ -967,7 +967,12 @@ fn enc_tq_probe(
     working_inf.width = pkg.width;
     working_inf.height = pkg.height;
     write_frames(&mut child, &pkg.yuv, frame_size, pkg.frame_count, &working_inf, conv_buf);
-    child.wait().unwrap();
+
+    let status = child.wait().unwrap();
+    if !status.success() {
+        std::process::exit(1);
+    }
+
     out
 }
 
@@ -1047,7 +1052,10 @@ fn enc_chunk(
     working_inf.height = pkg.height;
 
     write_frames(&mut child, &pkg.yuv, frame_size, pkg.frame_count, &working_inf, conv_buf);
-    child.wait().unwrap();
+    let status = child.wait().unwrap();
+    if !status.success() {
+        std::process::exit(1);
+    }
 }
 
 pub fn write_chunk_log(chunk_log: &crate::tq::ProbeLog, log_path: &Path, work_dir: &Path) {
