@@ -282,7 +282,7 @@ fn display_loop(
 ) {
     let start = Instant::now();
     let mut lines = vec![String::new(); worker_count];
-    let processed = Arc::new(AtomicUsize::new(init_frames));
+    let processed = Arc::new(AtomicUsize::new(0));
     let mut last_draw = Instant::now();
 
     loop {
@@ -305,12 +305,12 @@ fn display_loop(
         }
 
         if last_draw.elapsed() >= Duration::from_millis(1000) {
-            draw_screen(&lines, worker_count, &start, state, &processed);
+            draw_screen(&lines, worker_count, &start, state, &processed, init_frames);
             last_draw = Instant::now();
         }
     }
 
-    draw_screen(&lines, worker_count, &start, state, &processed);
+    draw_screen(&lines, worker_count, &start, state, &processed, init_frames);
 }
 
 fn draw_screen(
@@ -319,6 +319,7 @@ fn draw_screen(
     start: &Instant,
     state: &ProgState,
     processed: &Arc<AtomicUsize>,
+    init_frames: usize,
 ) {
     print!("\x1b[u");
 
@@ -335,20 +336,19 @@ fn draw_screen(
     let data = state.completions.lock().unwrap();
     let completed_frames: usize = data.chnks_done.iter().map(|c| c.frames).sum();
     let total_size: u64 = data.chnks_done.iter().map(|c| c.size).sum();
-    let chunk_frames: usize = data.chnks_done.iter().map(|c| c.frames).sum();
     drop(data);
 
     let processed_frames = processed.load(Ordering::Relaxed);
-    let frames_done = completed_frames.max(processed_frames);
+    let frames_done = completed_frames.max(init_frames + processed_frames);
 
     let elapsed_secs = start.elapsed().as_secs() as usize;
-    let fps = frames_done as f32 / elapsed_secs.max(1) as f32;
+    let fps = (frames_done.saturating_sub(init_frames)) as f32 / elapsed_secs.max(1) as f32;
     let remaining = state.total_frames.saturating_sub(frames_done);
     let eta_secs = remaining * elapsed_secs / frames_done.max(1);
     let chunks_done = state.completed.load(Ordering::Relaxed);
 
-    let (bitrate_str, est_str) = if chunk_frames > 0 {
-        let dur = chunk_frames as f32 * state.fps_den as f32 / state.fps_num as f32;
+    let (bitrate_str, est_str) = if completed_frames > 0 {
+        let dur = completed_frames as f32 * state.fps_den as f32 / state.fps_num as f32;
         let kbps = total_size as f32 * 8.0 / dur / 1000.0;
         let total_dur = state.total_frames as f32 * state.fps_den as f32 / state.fps_num as f32;
         let est_size = kbps * total_dur * 1000.0 / 8.0;

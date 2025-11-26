@@ -385,9 +385,9 @@ struct WorkerStats {
 }
 
 impl WorkerStats {
-    fn new(_completed_count: usize, _completed_frames: usize, resume_data: ResumeInf) -> Self {
+    fn new(completed_count: usize, resume_data: ResumeInf) -> Self {
         Self {
-            completed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            completed: Arc::new(std::sync::atomic::AtomicUsize::new(completed_count)),
             completions: Arc::new(std::sync::Mutex::new(resume_data)),
         }
     }
@@ -400,6 +400,47 @@ impl WorkerStats {
     }
 }
 
+fn load_resume_data(work_dir: &Path, resume: bool) -> ResumeInf {
+    if resume {
+        get_resume(work_dir).unwrap_or(ResumeInf { chnks_done: Vec::new() })
+    } else {
+        ResumeInf { chnks_done: Vec::new() }
+    }
+}
+
+fn build_skip_set(resume_data: &ResumeInf) -> (HashSet<usize>, usize, usize) {
+    let skip_indices: HashSet<usize> = resume_data.chnks_done.iter().map(|c| c.idx).collect();
+    let completed_count = skip_indices.len();
+    let completed_frames: usize = resume_data.chnks_done.iter().map(|c| c.frames).sum();
+    (skip_indices, completed_count, completed_frames)
+}
+
+fn create_stats(completed_count: usize, resume_data: ResumeInf) -> Arc<WorkerStats> {
+    Arc::new(WorkerStats::new(completed_count, resume_data))
+}
+
+fn create_progress(
+    quiet: bool,
+    chunks: &[Chunk],
+    inf: &VidInf,
+    worker_count: usize,
+    completed_frames: usize,
+    stats: &Arc<WorkerStats>,
+) -> Option<Arc<ProgsTrack>> {
+    if quiet {
+        None
+    } else {
+        Some(Arc::new(ProgsTrack::new(
+            chunks,
+            inf,
+            worker_count,
+            completed_frames,
+            Arc::clone(&stats.completed),
+            Arc::clone(&stats.completions),
+        )))
+    }
+}
+
 pub fn encode_all(
     chunks: &[Chunk],
     inf: &VidInf,
@@ -408,11 +449,7 @@ pub fn encode_all(
     work_dir: &Path,
     grain_table: Option<&PathBuf>,
 ) {
-    let resume_data = if args.resume {
-        get_resume(work_dir).unwrap_or(ResumeInf { chnks_done: Vec::new() })
-    } else {
-        ResumeInf { chnks_done: Vec::new() }
-    };
+    let resume_data = load_resume_data(work_dir, args.resume);
 
     #[cfg(feature = "vship")]
     {
@@ -423,25 +460,16 @@ pub fn encode_all(
         }
     }
 
-    let skip_indices: HashSet<usize> = resume_data.chnks_done.iter().map(|c| c.idx).collect();
-    let completed_count = skip_indices.len();
-    let completed_frames: usize = resume_data.chnks_done.iter().map(|c| c.frames).sum();
-
-    let stats = Some(Arc::new(WorkerStats::new(completed_count, completed_frames, resume_data)));
-
-    let prog = if args.quiet {
-        None
-    } else {
-        Some(Arc::new(ProgsTrack::new(
-            chunks,
-            inf,
-            args.worker,
-            completed_frames,
-            Arc::clone(&stats.as_ref().unwrap().completed),
-            Arc::clone(&stats.as_ref().unwrap().completions),
-        )))
-    };
-
+    let (skip_indices, completed_count, completed_frames) = build_skip_set(&resume_data);
+    let stats = Some(create_stats(completed_count, resume_data));
+    let prog = create_progress(
+        args.quiet,
+        chunks,
+        inf,
+        args.worker,
+        completed_frames,
+        stats.as_ref().unwrap(),
+    );
     let crop = args.crop.unwrap_or((0, 0));
 
     let (tx, rx) = bounded::<crate::worker::WorkPkg>(0);
@@ -496,15 +524,8 @@ fn encode_tq(
     work_dir: &Path,
     grain_table: Option<&PathBuf>,
 ) {
-    let resume_data = if args.resume {
-        get_resume(work_dir).unwrap_or(ResumeInf { chnks_done: Vec::new() })
-    } else {
-        ResumeInf { chnks_done: Vec::new() }
-    };
-
-    let skip_indices: HashSet<usize> = resume_data.chnks_done.iter().map(|c| c.idx).collect();
-    let completed_count = skip_indices.len();
-    let completed_frames: usize = resume_data.chnks_done.iter().map(|c| c.frames).sum();
+    let resume_data = load_resume_data(work_dir, args.resume);
+    let (skip_indices, completed_count, completed_frames) = build_skip_set(&resume_data);
 
     let tq_str = args.target_quality.as_ref().unwrap();
     let qp_str = args.qp_range.as_ref().unwrap();
@@ -590,20 +611,15 @@ fn encode_tq(
     let resume_state = Arc::new(std::sync::Mutex::new(resume_data.clone()));
     let tq_logger = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-    let stats = Some(Arc::new(WorkerStats::new(completed_count, completed_frames, resume_data)));
-
-    let st = stats.clone();
-
-    let prog = stats.as_ref().map(|s| {
-        Arc::new(ProgsTrack::new(
-            chunks,
-            inf,
-            args.worker * 2,
-            completed_frames,
-            Arc::clone(&s.completed),
-            Arc::clone(&s.completions),
-        ))
-    });
+    let stats = Some(create_stats(completed_count, resume_data));
+    let prog = create_progress(
+        args.quiet,
+        chunks,
+        inf,
+        args.worker * 2,
+        completed_frames,
+        stats.as_ref().unwrap(),
+    );
 
     let mut metrics_workers = Vec::new();
     for worker_id in 0..args.worker {
@@ -613,7 +629,7 @@ fn encode_tq(
         let inf = inf.clone();
         let wd = work_dir.to_path_buf();
         let metric_mode = args.metric_mode.clone();
-        let st = st.clone();
+        let st = stats.clone();
         let resume_state = Arc::clone(&resume_state);
         let tq_logger = Arc::clone(&tq_logger);
         let log_path = args.input.with_extension("log");
