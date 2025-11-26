@@ -460,22 +460,8 @@ pub fn pack_10bit(input: &[u8], output: &mut [u8]) {
     input.chunks_exact(8).zip(output.chunks_exact_mut(5)).for_each(|(i_chunk, o_chunk)| {
         let i_arr: &[u8; 8] = i_chunk.try_into().unwrap();
         let o_arr: &mut [u8; 5] = o_chunk.try_into().unwrap();
-
         pack_4_pix_10bit(*i_arr, o_arr);
     });
-
-    let remaining_in = input.len() % 8;
-    if remaining_in > 0 {
-        let processed_in = (input.len() / 8) * 8;
-        let processed_out = (output.len() / 5) * 5;
-        let mut temp = [0u8; 8];
-        temp[..remaining_in].copy_from_slice(&input[processed_in..]);
-
-        let output_chunk: &mut [u8; 5] =
-            unsafe { &mut *output.as_mut_ptr().add(processed_out).cast::<[u8; 5]>() };
-
-        pack_4_pix_10bit(temp, output_chunk);
-    }
 }
 
 pub fn unpack_10bit(input: &[u8], output: &mut [u8]) {

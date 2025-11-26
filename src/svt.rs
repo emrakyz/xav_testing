@@ -172,9 +172,8 @@ impl CropCalc {
     }
 }
 
-fn crop_and_pack_10bit(src: &[u8], dst: &mut [u8], calc: &CropCalc) {
+fn crop_and_pack_10bit(src: &[u8], dst: &mut [u8], calc: &CropCalc, temp: &mut [u8; 8]) {
     let mut dst_pos = 0;
-    let mut temp = [0u8; 8];
     let mut temp_pos = 0;
 
     for plane_idx in 0..3 {
@@ -190,7 +189,7 @@ fn crop_and_pack_10bit(src: &[u8], dst: &mut [u8], calc: &CropCalc) {
                 temp[temp_pos..temp_pos + 2].copy_from_slice(&src[src_off + i..src_off + i + 2]);
                 temp_pos += 2;
                 if temp_pos == 8 {
-                    pack_4_pix_10bit(temp, unsafe {
+                    pack_4_pix_10bit(*temp, unsafe {
                         &mut *dst[dst_pos..dst_pos + 5].as_mut_ptr().cast::<[u8; 5]>()
                     });
                     dst_pos += 5;
@@ -201,7 +200,7 @@ fn crop_and_pack_10bit(src: &[u8], dst: &mut [u8], calc: &CropCalc) {
     }
 
     if temp_pos > 0 {
-        pack_4_pix_10bit(temp, unsafe {
+        pack_4_pix_10bit(*temp, unsafe {
             &mut *dst[dst_pos..dst_pos + 5].as_mut_ptr().cast::<[u8; 5]>()
         });
     }
@@ -226,6 +225,7 @@ fn dec_10bit(
     );
 
     let mut frame_buf = vec![0u8; calc_10bit_size(inf)];
+    let mut pack_temp = [0u8; 8];
 
     for chunk in chunks {
         let chunk_len = chunk.end - chunk.start;
@@ -241,7 +241,7 @@ fn dec_10bit(
             let dst = &mut frames_data[start..start + packed_sz];
 
             if let Some(calc) = &crop_calc {
-                crop_and_pack_10bit(&frame_buf, dst, calc);
+                crop_and_pack_10bit(&frame_buf, dst, calc, &mut pack_temp);
             } else {
                 pack_10bit(&frame_buf, dst);
             }
